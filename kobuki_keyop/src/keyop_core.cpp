@@ -44,6 +44,30 @@
 #include <std_srvs/Empty.h>
 #include <kobuki_msgs/MotorPower.h>
 #include "../include/keyop_core/keyop_core.hpp"
+#include <iostream>
+#include <math.h>
+
+/*****************************************************************************
+ ** global vars & constants for UGV control
+ *****************************************************************************/
+#define PI 3.1415926
+#define MOVE_LINE_TRAJ 1 // 1 if moving a straight line, 0 for L traj
+
+const float start_position[2] = {2.2, 6.5}; 
+const float turn_point[2] = {2.5, 6.0}; 
+const float start_orientation = -0.5*PI; // yaw, rad
+// const float start_orientation = 0; // yaw, rad 
+const float end_position[2] = {2.2, 1.0}; 
+const float end_orientation = -0.5*PI; // yaw, rad
+const float K_ang = 1.5;
+const float K_lin = 0.5;
+const float MT_VEL = 0.15; // move traj const linear speed, MUST BE LESS THAN: linear_vel_max(3.4)
+
+float posi_cur[3] = {0, 0, 0}; //current position
+float orien_cur = 0.0; //current orientation
+double ang_err_first = 0;
+double ang_err_second = 0;
+double ang_err_mt = 0;
 
 /*****************************************************************************
  ** Namespaces
@@ -66,7 +90,7 @@ KeyOpCore::KeyOpCore() : last_zero_vel_sent(true), // avoid zero-vel messages fr
                          cmd(new geometry_msgs::Twist()),
                          cmd_stamped(new geometry_msgs::TwistStamped()),
                          linear_vel_step(0.1),
-                         linear_vel_max(3.4),
+                         linear_vel_max(3.4),   //note that wheel speed can saturate, |VL|<1.5 and |VR|<1.5, use this to determine the lin_vel and ang_vel
                          angular_vel_step(0.02),
                          angular_vel_max(1.2),
                          quit_requested(false),
@@ -107,6 +131,7 @@ bool KeyOpCore::init()
    ** Subscribers
    **********************/
   keyinput_subscriber = nh.subscribe("teleop", 1, &KeyOpCore::remoteKeyInputReceived, this);
+  viconPosition = nh.subscribe("kobuki", 10, &KeyOpCore::vicon_transform_callback, this);
 
   /*********************
    ** Publishers
@@ -192,7 +217,7 @@ bool KeyOpCore::init()
  */
 void KeyOpCore::spin()
 {
-  ros::Rate loop_rate(10);
+  ros::Rate loop_rate(10);  //was 10
 
   while (!quit_requested && ros::ok())
   {
@@ -208,6 +233,7 @@ void KeyOpCore::spin()
       velocity_publisher_.publish(cmd);
       last_zero_vel_sent = true;
     }
+
     accept_incoming = true;
     ros::spinOnce();
     loop_rate.sleep();
@@ -246,13 +272,15 @@ void KeyOpCore::keyboardInputLoop()
   raw.c_cc[VEOF] = 2;
   tcsetattr(key_file_descriptor, TCSANOW, &raw);
 
-  puts("Reading from keyboard");
+  puts("Reading from keyboard - LUO");
   puts("---------------------------");
   puts("Forward/back arrows : linear velocity incr/decr.");
   puts("Right/left arrows : angular velocity incr/decr.");
   puts("Spacebar : reset linear/angular velocities.");
   puts("d : disable motors.");
   puts("e : enable motors.");
+  puts("r : return.");
+  puts("m : moving.");
   puts("q : quit.");
   char c;
   while (!quit_requested)
@@ -272,6 +300,28 @@ void KeyOpCore::keyboardInputLoop()
 void KeyOpCore::remoteKeyInputReceived(const kobuki_msgs::KeyboardInput& key)
 {
   processKeyboardInput(key.pressedKey);
+}
+
+/**
+ * @brief This function is called when local VICON position data is available.
+ * In the example below, we make use of two arbitrary targets as
+ * an example for local position control.
+ */
+void KeyOpCore::vicon_transform_callback(const geometry_msgs::TransformStamped::ConstPtr& msg) 
+{
+  posi_cur[0] = msg->transform.translation.x;
+  posi_cur[1] = msg->transform.translation.y;
+  posi_cur[2] = msg->transform.translation.z;
+
+  double roll, pitch, yaw;
+  tf::Quaternion q(
+        msg->transform.rotation.x,
+        msg->transform.rotation.y,
+        msg->transform.rotation.z,
+        msg->transform.rotation.w);
+  tf::Matrix3x3 m(q);
+  m.getRPY(roll, pitch, yaw); 
+  orien_cur = yaw; //IMPORTANT  
 }
 
 /**
@@ -330,8 +380,19 @@ void KeyOpCore::processKeyboardInput(char c)
       enable();
       break;
     }
+    case 'r': // reset: starts moving or returns to the designated point
+    {
+      resetPosition();
+      break;
+    }
+    case 'm': // move: move the robot along the trajectory
+    {
+      moveTraj();
+      break;
+    }
     default:
     {
+      ROS_INFO_ONCE("wrong key.");
       break;
     }
   }
@@ -486,5 +547,288 @@ void KeyOpCore::resetVelocity()
     ROS_WARN_STREAM("KeyOp: motors are not yet powered up.");
   }
 }
+
+void KeyOpCore::resetPosition2()
+{
+  if (power_status)
+  {
+    if (((std::abs(start_position[0] - posi_cur[0])) < 0.1) && ((std::abs(start_position[1] - posi_cur[1])) < 0.1))
+    {        
+      double ang_err_second = start_orientation - orien_cur;
+      //anti-windup
+      if (ang_err_second < -1.0*PI) 
+      {
+        ang_err_second += 2.0*PI;
+      }
+      else if (ang_err_second > PI)
+      {
+        ang_err_second -= 2.0*PI;
+      }     
+      
+      if (std::abs(ang_err_second) < 3.0/180 * PI)
+      {
+        cmd->angular.z = 0.0;
+        cmd->linear.x = 0.0;
+        ROS_INFO_ONCE("=========Position Reset Complete========");
+        return;   //stop the program here and avoid the following  
+      } 
+      else 
+      {
+        cmd->angular.z =  ang_err_second * K_ang;
+        cmd->linear.x = 0.0;
+        ROS_INFO_STREAM("KeyOp: align final orientation.");
+        ROS_INFO_STREAM("target_ang(deg) = "<<start_orientation * 180/PI<<", orien_cur(deg) = "
+                        <<orien_cur * 180/PI<<", ang_err(deg) = "<<ang_err_second * 180/PI);  
+      }         
+    }
+
+    double norm = sqrt((start_position[0] - posi_cur[0])*(start_position[0] - posi_cur[0])
+              + (start_position[1] - posi_cur[1])*(start_position[1] - posi_cur[1]));
+    double target_ang = atan2((start_position[1] - posi_cur[1]), (start_position[0] - posi_cur[0]));
+    double ang_err_first = target_ang - orien_cur;
+
+    //anti-windup
+    if (ang_err_first < -1.0*PI) 
+    {
+      ang_err_first += 2.0*PI;
+    }
+    else if (ang_err_first > PI)
+    {
+      ang_err_first -= 2.0*PI;
+    }
+
+    cmd->angular.z = ang_err_first * K_ang;
+    cmd->linear.x = norm * K_lin;
+    ROS_INFO_STREAM("KeyOp: reset position.");
+    // ROS_INFO_STREAM("target_ang(deg) = "<<target_ang * 180/PI<<", orien_cur(deg) = "
+                    // <<orien_cur * 180/PI<<", ang_err(deg) = "<<ang_err_first * 180/PI);
+    // ROS_INFO_STREAM("posi cur x = "<<posi_cur[0]<<", posi cur y = "<<posi_cur[1]<<", orien cur(deg) = "<<orien_cur * 180/PI);    
+  }
+  else
+  {
+    ROS_WARN_STREAM("KeyOp: motors are not yet powered up.");
+  }
+}
+
+void KeyOpCore::resetPosition()
+{
+  if (power_status)
+  {
+    ROS_INFO_STREAM_ONCE("KeyOp: reset position.");
+    while(!(((std::abs(start_position[0] - posi_cur[0])) < 0.1) && ((std::abs(start_position[1] - posi_cur[1])) < 0.1))) 
+    {
+      double norm = sqrt((start_position[0] - posi_cur[0])*(start_position[0] - posi_cur[0])
+              + (start_position[1] - posi_cur[1])*(start_position[1] - posi_cur[1]));
+      double target_ang = atan2((start_position[1] - posi_cur[1]), (start_position[0] - posi_cur[0]));
+      ang_err_first = target_ang - orien_cur;
+
+      //anti-windup
+      if (ang_err_first < -1.0*PI) 
+      {
+        ang_err_first += 2.0*PI;
+      }
+      else if (ang_err_first > PI)
+      {
+        ang_err_first -= 2.0*PI;
+      }
+
+      cmd->angular.z = ang_err_first * K_ang;
+      cmd->linear.x = norm * K_lin;  
+      //limit speeds
+      if (cmd->angular.z > angular_vel_max)   {
+        cmd->angular.z = angular_vel_max;  
+      }               
+      else if(cmd->angular.z < -1.0*angular_vel_max) {
+        cmd->angular.z = -1.0*angular_vel_max; 
+      }
+
+      if (cmd->linear.x > linear_vel_max) {
+        cmd->linear.x = linear_vel_max;
+      }
+      // ROS_INFO_STREAM("target_ang(deg) = "<<target_ang * 180/PI<<", orien_cur(deg) = "
+                      // <<orien_cur * 180/PI<<", ang_err(deg) = "<<ang_err_first * 180/PI);
+      // ROS_INFO_STREAM("posi cur x = "<<posi_cur[0]<<", posi cur y = "<<posi_cur[1]<<", orien cur(deg) = "<<orien_cur * 180/PI);    
+      // ROS_INFO_STREAM("after: cmd->angular.z = "<<cmd->angular.z<<", cmd->linear.x = "<<cmd->linear.x);
+    }
+    
+    ROS_INFO_STREAM_ONCE("KeyOp: align final orientation.");
+    do {
+      ang_err_second = start_orientation - orien_cur;
+      //anti-windup
+      if (ang_err_second < -1.0*PI) 
+      {
+        ang_err_second += 2.0*PI;
+      }
+      else if (ang_err_second > PI)
+      {
+        ang_err_second -= 2.0*PI;
+      }     
+      
+      cmd->angular.z =  ang_err_second * K_ang;
+      cmd->linear.x = 0.0; 
+      //limit speeds
+      if (cmd->angular.z > angular_vel_max)      
+        cmd->angular.z = angular_vel_max;      
+      else if(cmd->angular.z < -1.0*angular_vel_max)
+        cmd->angular.z = -angular_vel_max; 
+
+      // ROS_INFO_STREAM("target_ang(deg) = "<<start_orientation * 180/PI<<", orien_cur(deg) = "
+                      // <<orien_cur * 180/PI<<", ang_err(deg) = "<<ang_err_second * 180/PI);  
+              
+    } while(!(std::abs(ang_err_second) < 3.0/180 * PI));
+
+    cmd->angular.z = 0.0;
+    cmd->linear.x = 0.0;
+    ROS_INFO_STREAM_ONCE("=========Position Reset Complete========");
+  }
+  else
+  {
+    ROS_WARN_STREAM("KeyOp: motors are not yet powered up.");
+  }
+}
+
+void KeyOpCore::moveTraj()
+{
+  if (power_status)
+  {
+    if (MOVE_LINE_TRAJ)
+    { 
+      ROS_INFO_STREAM_ONCE("KeyOp: moving the given trajectory.");
+      while(!(((std::abs(end_position[0] - posi_cur[0])) < 0.1) && ((std::abs(end_position[1] - posi_cur[1])) < 0.1))) 
+      {
+        double norm = sqrt((end_position[0] - posi_cur[0])*(end_position[0] - posi_cur[0])
+                + (end_position[1] - posi_cur[1])*(end_position[1] - posi_cur[1]));
+        double target_ang = atan2((end_position[1] - posi_cur[1]), (end_position[0] - posi_cur[0]));
+        ang_err_mt = target_ang - orien_cur;
+
+        //anti-windup
+        if (ang_err_mt < -1.0*PI) 
+        {
+          ang_err_mt += 2.0*PI;
+        }
+        else if (ang_err_mt > PI)
+        {
+          ang_err_mt -= 2.0*PI;
+        }
+
+        cmd->angular.z = ang_err_mt * K_ang;
+        cmd->linear.x = MT_VEL;
+        //limit speeds
+        if (cmd->angular.z > angular_vel_max)      
+          cmd->angular.z = angular_vel_max;      
+        else if(cmd->angular.z < -1.0*angular_vel_max)
+          cmd->angular.z = -angular_vel_max; 
+      
+        // ROS_INFO_STREAM("target_ang(deg) = "<<target_ang * 180/PI<<", orien_cur(deg) = "
+                        // <<orien_cur * 180/PI<<", ang_err(deg) = "<<ang_err_mt * 180/PI);
+        // ROS_INFO_STREAM("posi cur x = "<<posi_cur[0]<<", posi cur y = "<<posi_cur[1]<<", orien cur(deg) = "<<orien_cur * 180/PI);    
+      }
+    }
+    
+    if (!MOVE_LINE_TRAJ) 
+    {
+      ROS_INFO_STREAM_ONCE("KeyOp: moving the given trajectory -- PART 1.");
+      while(!(((std::abs(turn_point[0] - posi_cur[0])) < 0.1) && ((std::abs(turn_point[1] - posi_cur[1])) < 0.1))) 
+      {
+        double norm = sqrt((turn_point[0] - posi_cur[0])*(turn_point[0] - posi_cur[0])
+                + (turn_point[1] - posi_cur[1])*(turn_point[1] - posi_cur[1]));
+        double target_ang = atan2((turn_point[1] - posi_cur[1]), (turn_point[0] - posi_cur[0]));
+        ang_err_mt = target_ang - orien_cur;
+
+        //anti-windup
+        if (ang_err_mt < -1.0*PI) 
+        {
+          ang_err_mt += 2.0*PI;
+        }
+        else if (ang_err_mt > PI)
+        {
+          ang_err_mt -= 2.0*PI;
+        }
+
+        cmd->angular.z = ang_err_mt * K_ang;
+        cmd->linear.x = MT_VEL;
+        //limit speeds
+        if (cmd->angular.z > angular_vel_max)      
+          cmd->angular.z = angular_vel_max;      
+        else if(cmd->angular.z < -1.0*angular_vel_max)
+          cmd->angular.z = -angular_vel_max; 
+      
+        // ROS_INFO_STREAM("target_ang(deg) = "<<target_ang * 180/PI<<", orien_cur(deg) = "
+                        // <<orien_cur * 180/PI<<", ang_err(deg) = "<<ang_err_mt * 180/PI);
+        // ROS_INFO_STREAM("posi cur x = "<<posi_cur[0]<<", posi cur y = "<<posi_cur[1]<<", orien cur(deg) = "<<orien_cur * 180/PI);    
+      }
+      
+      ROS_INFO_STREAM_ONCE("KeyOp: moving the given trajectory -- PART 2: rotation.");
+      do {
+        ang_err_second = end_orientation - orien_cur;
+        //anti-windup
+        if (ang_err_second < -1.0*PI) 
+        {
+          ang_err_second += 2.0*PI;
+        }
+        else if (ang_err_second > PI)
+        {
+          ang_err_second -= 2.0*PI;
+        }     
+        
+        cmd->angular.z =  ang_err_second * K_ang;
+        cmd->linear.x = 0.0; 
+        //limit speeds
+        if (cmd->angular.z > angular_vel_max)      
+          cmd->angular.z = angular_vel_max;      
+        else if(cmd->angular.z < -1.0*angular_vel_max)
+          cmd->angular.z = -angular_vel_max; 
+
+        // ROS_INFO_STREAM("target_ang(deg) = "<<start_orientation * 180/PI<<", orien_cur(deg) = "
+                        // <<orien_cur * 180/PI<<", ang_err(deg) = "<<ang_err_second * 180/PI);  
+                
+      } while(!(std::abs(ang_err_second) < 3.0/180 * PI));
+
+      cmd->angular.z = 0.0;
+      cmd->linear.x = 0.0;
+    
+      ROS_INFO_STREAM_ONCE("KeyOp: moving the given trajectory -- PART 3.");
+      while(!(((std::abs(end_position[0] - posi_cur[0])) < 0.1) && ((std::abs(end_position[1] - posi_cur[1])) < 0.1))) 
+      {
+        double norm = sqrt((end_position[0] - posi_cur[0])*(end_position[0] - posi_cur[0])
+                + (end_position[1] - posi_cur[1])*(end_position[1] - posi_cur[1]));
+        double target_ang = atan2((end_position[1] - posi_cur[1]), (end_position[0] - posi_cur[0]));
+        ang_err_mt = target_ang - orien_cur;
+
+        //anti-windup
+        if (ang_err_mt < -1.0*PI) 
+        {
+          ang_err_mt += 2.0*PI;
+        }
+        else if (ang_err_mt > PI)
+        {
+          ang_err_mt -= 2.0*PI;
+        }
+
+        cmd->angular.z = ang_err_mt * K_ang;
+        cmd->linear.x = MT_VEL;
+        //limit speeds
+        if (cmd->angular.z > angular_vel_max)      
+          cmd->angular.z = angular_vel_max;      
+        else if(cmd->angular.z < -1.0*angular_vel_max)
+          cmd->angular.z = -angular_vel_max; 
+      
+        // ROS_INFO_STREAM("target_ang(deg) = "<<target_ang * 180/PI<<", orien_cur(deg) = "
+                        // <<orien_cur * 180/PI<<", ang_err(deg) = "<<ang_err_mt * 180/PI);
+        // ROS_INFO_STREAM("posi cur x = "<<posi_cur[0]<<", posi cur y = "<<posi_cur[1]<<", orien cur(deg) = "<<orien_cur * 180/PI);    
+      }
+
+    }
+    
+    cmd->angular.z = 0.0;
+    cmd->linear.x = 0.0;
+    ROS_INFO_STREAM_ONCE("=========Trajectory Complete========");
+  }
+  else
+  {
+    ROS_WARN_STREAM("KeyOp: motors are not yet powered up.");
+  }
+}
+
 
 } // namespace keyop_core

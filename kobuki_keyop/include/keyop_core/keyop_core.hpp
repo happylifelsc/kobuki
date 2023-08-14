@@ -46,10 +46,12 @@
  *****************************************************************************/
 
 #include <ros/ros.h>
+#include <tf/tf.h>
 #include <termios.h> // for keyboard input
 #include <ecl/threads.hpp>
 #include <geometry_msgs/Twist.h>  // for velocity commands
 #include <geometry_msgs/TwistStamped.h>  // for velocity commands
+#include <geometry_msgs/TransformStamped.h>
 #include <kobuki_msgs/KeyboardInput.h> // keycodes from remote teleops.
 
 /*****************************************************************************
@@ -83,6 +85,7 @@ public:
 
 private:
   ros::Subscriber keyinput_subscriber;
+  ros::Subscriber viconPosition;
   ros::Publisher velocity_publisher_;
   ros::Publisher motor_power_publisher_;
   bool last_zero_vel_sent;
@@ -105,6 +108,9 @@ private:
   void incrementAngularVelocity();
   void decrementAngularVelocity();
   void resetVelocity();
+  void resetPosition();
+  void resetPosition2();
+  void moveTraj();
 
   /*********************
    ** Keylogging
@@ -118,6 +124,11 @@ private:
   int key_file_descriptor;
   struct termios original_terminal_state;
   ecl::Thread thread;
+
+  /*********************
+   ** Vicon positioning
+   **********************/
+  void vicon_transform_callback(const geometry_msgs::TransformStamped::ConstPtr& msg);
 };
 
 } // namespace keyop_core
